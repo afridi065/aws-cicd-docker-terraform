@@ -1,0 +1,65 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPO: flask-cicd-app
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test
+        working-directory: app
+        run: |
+          pip install -r requirements.txt
+          python -c "from app import app; assert app.test_client().get('/health').status_code == 200"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE=$REGISTRY/$ECR_REPO
+          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest app
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
+
+      - name: Deploy to EC2
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          IMAGE=$REGISTRY/$ECR_REPO:${{ github.sha }}
+          cat > cmds.json << EOF
+          {"commands":[
+          "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY",
+          "docker pull $IMAGE",
+          "docker rm -f myapp || true",
+          "docker run -d --name myapp --restart unless-stopped -p 80:5000 $IMAGE",
+          "sleep 5",
+          "curl -f http://localhost/health"
+          ]}
+          EOF
+          CMD_ID=$(aws ssm send-command --instance-ids $INSTANCE_ID \
+            --document-name AWS-RunShellScript \
+            --parameters file://cmds.json \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id $CMD_ID --instance-id $INSTANCE_ID
