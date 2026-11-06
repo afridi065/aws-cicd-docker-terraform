@@ -1,0 +1,48 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "ECR image tag to deploy (a commit SHA)"
+        required: true
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPO: flask-cicd-app
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Deploy chosen tag
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          IMAGE=$REGISTRY/$ECR_REPO:$TAG
+          cat > cmds.json << EOF
+          {"commands":[
+          "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY",
+          "docker pull $IMAGE",
+          "docker rm -f myapp || true",
+          "docker run -d --name myapp --restart unless-stopped -p 80:5000 $IMAGE",
+          "sleep 5",
+          "curl -f http://localhost/health"
+          ]}
+          EOF
+          CMD_ID=$(aws ssm send-command --instance-ids $INSTANCE_ID \
+            --document-name AWS-RunShellScript \
+            --parameters file://cmds.json \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id $CMD_ID --instance-id $INSTANCE_ID
